@@ -18,6 +18,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test menu_test.js
+      - run: go vet ./...
       - run: go test -race ./...
       - run: mkdir -p ../dist
       - run: go build -buildmode=c-shared -o ../dist/provider-rate-limiter-${{ matrix.os }} .

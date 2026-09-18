@@ -1,8 +1,8 @@
-module github.com/yourname/cliproxyapi-provider-rate-limiter-plugin
+module github.com/hetonghao/cliproxyapi-provider-rate-limiter-plugin
 
 go 1.26.0
 
 require (
-	github.com/router-for-me/CLIProxyAPI/v7 v7.2.139
+	github.com/router-for-me/CLIProxyAPI/v7 v7.3.7
 	gopkg.in/yaml.v3 v3.0.1
 )

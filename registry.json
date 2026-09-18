@@ -4,16 +4,17 @@
     {
       "id": "provider-rate-limiter",
       "name": "Provider Rate Limiter",
-      "description": "Applies independent sliding-window RPM limits to CPA auth candidates through the official scheduler plugin capability, with provider defaults and per-auth overrides.",
-      "author": "lsmallice",
-      "version": "0.4.2",
-      "repository": "https://github.com/lsmallice/cliproxyapi-provider-rate-limiter-plugin",
-      "homepage": "https://github.com/lsmallice/cliproxyapi-provider-rate-limiter-plugin",
+      "description": "Per-auth sliding-window RPM limits with bounded candidate-aware queuing and provider/auth management for all scheduler-visible CPA credentials.",
+      "author": "hetonghao",
+      "version": "0.5.0-aicove.1",
+      "repository": "https://github.com/hetonghao/cliproxyapi-provider-rate-limiter-plugin",
+      "homepage": "https://github.com/hetonghao/cliproxyapi-provider-rate-limiter-plugin",
       "license": "MIT",
       "tags": [
         "Scheduler",
         "Rate Limit",
-        "Codex",
+        "Queue",
+        "All providers",
         "Multi-account"
       ]
     }
