@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"runtime"
 	"strings"
@@ -604,5 +605,89 @@ func TestConcurrentPicksRespectRPM(t *testing.T) {
 	wg.Wait()
 	if got := admitted.Load(); got != 5 {
 		t.Fatalf("admitted %d picks, want 5", got)
+	}
+}
+
+func TestQueueTimeoutEnvelopeCarriesStopRetry(t *testing.T) {
+	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 1\nqueue_max_wait_ms: 15000\n")})); err != nil {
+		t.Fatal(err)
+	}
+	testQueue, clock := newTestQueue()
+	oldQueue := queue
+	queue = testQueue
+	defer func() {
+		queue = oldQueue
+		testQueue.shutdown()
+	}()
+	request := testJSON(pluginapi.SchedulerPickRequest{
+		Provider:   "codex",
+		Candidates: []pluginapi.SchedulerAuthCandidate{candidate("timeout-account", "codex")},
+	})
+	if _, err := pick(request); err != nil {
+		t.Fatal(err)
+	}
+	blocked := make(chan []byte, 1)
+	go func() {
+		b, err := pick(request)
+		if err != nil {
+			b = []byte("err: " + err.Error())
+		}
+		blocked <- b
+	}()
+	waitForWaiters(t, testQueue, 1)
+	clock.Add(15 * time.Second)
+	testQueue.signalWake()
+	var raw []byte
+	select {
+	case raw = <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued pick did not complete")
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode envelope: %v (%s)", err, raw)
+	}
+	if env.Error == nil || env.Error.HTTPStatus != http.StatusTooManyRequests || !env.Error.StopRetry {
+		t.Fatalf("timeout envelope = %s, want stop_retry with 429", raw)
+	}
+	if env.Error.Retryable {
+		t.Fatalf("timeout envelope must not carry retryable: %s", raw)
+	}
+	if !strings.Contains(env.Error.Message, "waited_ms=15000") {
+		t.Fatalf("timeout envelope missing waited_ms=15000: %s", raw)
+	}
+	testQueue.mu.Lock()
+	hits := len(testQueue.windows["timeout-account"].hits)
+	testQueue.mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("consumed hits = %d, want 1", hits)
+	}
+}
+
+func TestErrorEnvelopeStopRetryMarksOnlyLocalRejection(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		outcome  pickOutcome
+		wantStop bool
+	}{
+		{name: "timeout", outcome: rateLimitOutcome("codex"), wantStop: true},
+		{name: "queue-full", outcome: queueFullOutcome("codex"), wantStop: true},
+		{name: "stopped", outcome: stoppedOutcome(), wantStop: false},
+		{name: "generic", outcome: pickOutcome{code: "invalid_config", message: "check", status: http.StatusBadRequest}, wantStop: false},
+	} {
+		raw := errorEnvelopeWithStatus(tc.outcome.code, tc.outcome.message, tc.outcome.status)
+		var env envelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatalf("%s decode: %v", tc.name, err)
+		}
+		if env.Error == nil {
+			t.Fatalf("%s envelope missing error: %s", tc.name, raw)
+		}
+		if env.Error.StopRetry != tc.wantStop {
+			t.Fatalf("%s stop_retry = %v, want %v: %s", tc.name, env.Error.StopRetry, tc.wantStop, raw)
+		}
+		if env.Error.Retryable {
+			t.Fatalf("%s must not carry retryable: %s", tc.name, raw)
+		}
 	}
 }

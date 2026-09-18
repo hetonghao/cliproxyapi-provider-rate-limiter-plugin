@@ -61,7 +61,7 @@ func TestConfigureNormalizesProviderKeysWithoutMutatingWhileRanging(t *testing.T
 	}
 }
 
-func TestRateLimitErrorCarriesRetryableHTTPStatus(t *testing.T) {
+func TestRateLimitErrorCarriesStopRetryHTTPStatus(t *testing.T) {
 	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 1\nqueue_enabled: false\n")})); err != nil {
 		t.Fatal(err)
 	}
@@ -76,8 +76,11 @@ func TestRateLimitErrorCarriesRetryableHTTPStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"http_status":429`) || !strings.Contains(string(raw), `"retryable":true`) {
+	if !strings.Contains(string(raw), `"http_status":429`) || !strings.Contains(string(raw), `"stop_retry":true`) {
 		t.Fatalf("rate-limit response = %s", raw)
+	}
+	if strings.Contains(string(raw), `"retryable"`) {
+		t.Fatalf("rate-limit response must not carry retryable: %s", raw)
 	}
 }
 
