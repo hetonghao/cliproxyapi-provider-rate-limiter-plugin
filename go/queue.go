@@ -17,9 +17,16 @@ type pickOutcome struct {
 	status  int
 }
 
+// schedulerPreferredAuthMetadataKey is the host-provided preferred auth in
+// SchedulerPickRequest.Options.Metadata. The host sets it to the auth its own
+// selector (round-robin, session affinity, pinned, priority) already chose, so
+// the plugin only vetoes it when that credential is over the rate limit.
+const schedulerPreferredAuthMetadataKey = "scheduler_preferred_auth_id"
+
 type waiter struct {
 	candidates        []pluginapi.SchedulerAuthCandidate
 	provider          string
+	preferredID       string
 	started, deadline time.Time
 	result            chan pickOutcome
 }
@@ -28,6 +35,7 @@ type admissionQueue struct {
 	mu              sync.Mutex
 	waiters         []*waiter
 	windows         map[string]*window
+	lastPicked      map[string]string
 	wake            chan struct{}
 	running, closed bool
 	now             func() time.Time
@@ -35,7 +43,7 @@ type admissionQueue struct {
 }
 
 func newAdmissionQueue(now func() time.Time, duration time.Duration) *admissionQueue {
-	return &admissionQueue{windows: map[string]*window{}, wake: make(chan struct{}, 1), now: now, duration: duration}
+	return &admissionQueue{windows: map[string]*window{}, lastPicked: map[string]string{}, wake: make(chan struct{}, 1), now: now, duration: duration}
 }
 
 var queue = newAdmissionQueue(time.Now, time.Minute)
@@ -68,6 +76,59 @@ func (q *admissionQueue) signalWake() {
 	}
 }
 
+func requestPreferredAuthID(req pluginapi.SchedulerPickRequest) string {
+	raw, ok := req.Options.Metadata[schedulerPreferredAuthMetadataKey].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(raw)
+}
+
+// admitLocked selects one candidate that is under its rate limit. The host's
+// preferred auth wins whenever it has capacity; otherwise candidates are tried
+// in round-robin order starting after the last admitted auth, so spillover
+// spreads across accounts instead of always landing on the lowest-sorted ID.
+func (q *admissionQueue) admitLocked(now time.Time, cfg pluginConfig, candidates []pluginapi.SchedulerAuthCandidate, scope, preferredID string) (string, bool) {
+	if len(candidates) == 0 {
+		return "", false
+	}
+	if preferredID != "" {
+		for _, c := range candidates {
+			if c.ID != preferredID {
+				continue
+			}
+			if q.windowFor(c.ID).allowFor(now, limitFor(cfg, c), q.duration) {
+				q.lastPicked[scope] = c.ID
+				return c.ID, true
+			}
+			break
+		}
+	}
+	start := 0
+	if last := q.lastPicked[scope]; last != "" {
+		for i, c := range candidates {
+			if c.ID == last {
+				start = i + 1
+				break
+			}
+		}
+		if start >= len(candidates) {
+			start = 0
+		}
+	}
+	for k := 0; k < len(candidates); k++ {
+		c := candidates[(start+k)%len(candidates)]
+		if c.ID == preferredID {
+			continue
+		}
+		if q.windowFor(c.ID).allowFor(now, limitFor(cfg, c), q.duration) {
+			q.lastPicked[scope] = c.ID
+			return c.ID, true
+		}
+	}
+	return "", false
+}
+
 func (q *admissionQueue) pick(req pluginapi.SchedulerPickRequest) pickOutcome {
 	candidates := make([]pluginapi.SchedulerAuthCandidate, 0, len(req.Candidates))
 	for _, c := range req.Candidates {
@@ -83,11 +144,9 @@ func (q *admissionQueue) pick(req pluginapi.SchedulerPickRequest) pickOutcome {
 	now := q.now()
 	cfg := loaded()
 	q.dispatchLocked(now, cfg)
-	for _, c := range candidates {
-		if q.windowFor(c.ID).allowFor(now, limitFor(cfg, c), q.duration) {
-			q.mu.Unlock()
-			return pickOutcome{authID: c.ID}
-		}
+	if authID, ok := q.admitLocked(now, cfg, candidates, req.Provider, requestPreferredAuthID(req)); ok {
+		q.mu.Unlock()
+		return pickOutcome{authID: authID}
 	}
 	if len(candidates) == 0 || !cfg.QueueEnabled || cfg.QueueMaxWaitMS <= 0 {
 		q.mu.Unlock()
@@ -98,11 +157,12 @@ func (q *admissionQueue) pick(req pluginapi.SchedulerPickRequest) pickOutcome {
 		return queueFullOutcome(req.Provider)
 	}
 	w := &waiter{
-		candidates: candidates,
-		provider:   req.Provider,
-		started:    now,
-		deadline:   now.Add(time.Duration(cfg.QueueMaxWaitMS) * time.Millisecond),
-		result:     make(chan pickOutcome, 1),
+		candidates:  candidates,
+		provider:    req.Provider,
+		preferredID: requestPreferredAuthID(req),
+		started:     now,
+		deadline:    now.Add(time.Duration(cfg.QueueMaxWaitMS) * time.Millisecond),
+		result:      make(chan pickOutcome, 1),
 	}
 	q.waiters = append(q.waiters, w)
 	if !q.running {
@@ -134,15 +194,8 @@ func (q *admissionQueue) dispatchLocked(now time.Time, cfg pluginConfig) time.Ti
 			w.result <- rateLimitOutcome(w.provider)
 			continue
 		}
-		admitted := false
-		for _, c := range w.candidates {
-			if q.windowFor(c.ID).allowFor(now, limitFor(cfg, c), q.duration) {
-				w.result <- pickOutcome{authID: c.ID}
-				admitted = true
-				break
-			}
-		}
-		if admitted {
+		if authID, admitted := q.admitLocked(now, cfg, w.candidates, w.provider, w.preferredID); admitted {
+			w.result <- pickOutcome{authID: authID}
 			continue
 		}
 		if next.IsZero() || w.deadline.Before(next) {

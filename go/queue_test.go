@@ -608,6 +608,111 @@ func TestConcurrentPicksRespectRPM(t *testing.T) {
 	}
 }
 
+func preferredRequest(preferredID string, ids ...string) pluginapi.SchedulerPickRequest {
+	candidates := make([]pluginapi.SchedulerAuthCandidate, 0, len(ids))
+	for _, id := range ids {
+		candidates = append(candidates, candidate(id, "codex"))
+	}
+	req := pluginapi.SchedulerPickRequest{Provider: "codex", Model: "gpt-6-astra", Candidates: candidates}
+	if preferredID != "" {
+		req.Options.Metadata = map[string]any{schedulerPreferredAuthMetadataKey: preferredID}
+	}
+	return req
+}
+
+func TestQueuePickRoundRobinsAcrossCandidates(t *testing.T) {
+	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 10\nqueue_enabled: false\n")})); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := newTestQueue()
+	defer q.shutdown()
+	req := preferredRequest("", "rr-a", "rr-b", "rr-c")
+	var got []string
+	for i := 0; i < 6; i++ {
+		outcome := q.pick(req)
+		if outcome.authID == "" {
+			t.Fatalf("pick %d rejected: %+v", i, outcome)
+		}
+		got = append(got, outcome.authID)
+	}
+	want := []string{"rr-a", "rr-b", "rr-c", "rr-a", "rr-b", "rr-c"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("pick order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestQueuePickRoundRobinSkipsSaturatedCandidate(t *testing.T) {
+	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 1\nqueue_enabled: false\n")})); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := newTestQueue()
+	defer q.shutdown()
+	req := preferredRequest("", "sat-a", "sat-b")
+	if outcome := q.pick(req); outcome.authID != "sat-a" {
+		t.Fatalf("first pick = %+v", outcome)
+	}
+	if outcome := q.pick(req); outcome.authID != "sat-b" {
+		t.Fatalf("second pick must spill to sat-b, got %+v", outcome)
+	}
+	if outcome := q.pick(req); outcome.status != http.StatusTooManyRequests {
+		t.Fatalf("third pick must reject when all saturated, got %+v", outcome)
+	}
+}
+
+func TestQueuePickHonorsHostPreferredAuth(t *testing.T) {
+	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 10\nqueue_enabled: false\n")})); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := newTestQueue()
+	defer q.shutdown()
+	for i := 0; i < 4; i++ {
+		if outcome := q.pick(preferredRequest("pref-b", "pref-a", "pref-b", "pref-c")); outcome.authID != "pref-b" {
+			t.Fatalf("preferred pick %d = %+v, want pref-b", i, outcome)
+		}
+	}
+	if outcome := q.pick(preferredRequest("", "pref-a", "pref-b", "pref-c")); outcome.authID != "pref-c" {
+		t.Fatalf("anonymous pick must rotate past last admitted pref-b, got %+v", outcome)
+	}
+}
+
+func TestQueuePickPreferredOverLimitSpillsRoundRobin(t *testing.T) {
+	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 1\nqueue_enabled: false\n")})); err != nil {
+		t.Fatal(err)
+	}
+	q, clock := newTestQueue()
+	defer q.shutdown()
+	sticky := preferredRequest("ov-a", "ov-a", "ov-b", "ov-c")
+	if outcome := q.pick(sticky); outcome.authID != "ov-a" {
+		t.Fatalf("first pick = %+v", outcome)
+	}
+	if outcome := q.pick(sticky); outcome.authID != "ov-b" {
+		t.Fatalf("saturated preferred must spill via rotation, got %+v", outcome)
+	}
+	if outcome := q.pick(sticky); outcome.authID != "ov-c" {
+		t.Fatalf("spill must keep rotating, got %+v", outcome)
+	}
+	clock.Add(61 * time.Second)
+	if outcome := q.pick(sticky); outcome.authID != "ov-a" {
+		t.Fatalf("preferred auth must win again after its window resets, got %+v", outcome)
+	}
+}
+
+func TestQueuePickPreferredMissingFallsBackToRotation(t *testing.T) {
+	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 10\nqueue_enabled: false\n")})); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := newTestQueue()
+	defer q.shutdown()
+	if outcome := q.pick(preferredRequest("ghost", "miss-a", "miss-b")); outcome.authID != "miss-a" {
+		t.Fatalf("unknown preferred must fall back to rotation, got %+v", outcome)
+	}
+	if outcome := q.pick(preferredRequest("ghost", "miss-a", "miss-b")); outcome.authID != "miss-b" {
+		t.Fatalf("rotation must continue after fallback, got %+v", outcome)
+	}
+}
+
 func TestQueueTimeoutEnvelopeCarriesStopRetry(t *testing.T) {
 	if err := configure(testJSON(lifecycleRequest{ConfigYAML: []byte("default_rpm: 1\nqueue_max_wait_ms: 15000\n")})); err != nil {
 		t.Fatal(err)

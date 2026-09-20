@@ -6,7 +6,7 @@
       "name": "Provider Rate Limiter",
       "description": "Per-auth sliding-window RPM limits with bounded candidate-aware queuing and provider/auth management for all scheduler-visible CPA credentials.",
       "author": "hetonghao",
-      "version": "0.5.1-aicove.1",
+      "version": "0.5.2-aicove.1",
       "repository": "https://github.com/hetonghao/cliproxyapi-provider-rate-limiter-plugin",
       "homepage": "https://github.com/hetonghao/cliproxyapi-provider-rate-limiter-plugin",
       "license": "MIT",
